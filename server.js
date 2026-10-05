@@ -31,10 +31,21 @@ app.use(express.json({ limit: '8mb' }));
 const wrap = f => (req, res) => Promise.resolve(f(req, res)).catch(e => { console.error(e); res.status(500).json({ ok: false, error: 'Server error' }); });
 
 const admin = (req, res, next) => (E.ADMIN_TOKEN && req.get('X-Admin') === E.ADMIN_TOKEN) ? next() : res.status(401).json({ ok: false, error: 'Unauthorized' });
+db.robots = db.robots || {};
+app.post('/admin/robots', admin, (req, res) => {          // {name, author, platform, cover(dataURL)}
+  const b = req.body || {}, name = String(b.name || '').trim().slice(0, 60); if (!name) return res.status(400).json({ ok: false, error: 'Robot name required' });
+  const cover = String(b.cover || ''); if (cover && (!/^data:image\/(jpeg|png|webp);base64,/.test(cover) || cover.length > 400000)) return res.status(400).json({ ok: false, error: 'Cover must be a small jpeg/png/webp image' });
+  if (Object.values(db.robots).some(r => r.name.toLowerCase() === name.toLowerCase())) return res.status(400).json({ ok: false, error: 'A robot with this name exists' });
+  const id = 'RB-' + rnd(5); db.robots[id] = { name, author: String(b.author || '').slice(0, 60), platform: b.platform === 'MT4' ? 'MT4' : 'MT5', cover, active: true, created: Date.now() };
+  save(); res.json({ ok: true, id });
+});
+app.get('/admin/robots', admin, (req, res) => res.json({ ok: true, robots: db.robots }));
+app.post('/admin/robots/:id/toggle', admin, (req, res) => { const r = db.robots[req.params.id]; if (!r) return res.status(404).json({ ok: false }); r.active = req.body.active === true; save(); res.json({ ok: true, active: r.active }); });
 const PLANS = { '3d': 3, '5d': 5, '30d': 30, '3m': 90, '6m': 180, '1y': 365, lifetime: null };
 app.post('/admin/keys', admin, (req, res) => {           // {client, ea, plan, mentorEmail, count}
   const b = req.body || {}; if (!(b.plan in PLANS)) return res.status(400).json({ ok: false, error: 'Bad plan' });
-  const out = []; for (let i = 0; i < Math.min(+b.count || 1, 100); i++) { const k = newKey(); db.keys[k] = { created: Date.now(), client: String(b.client || '').slice(0, 80), ea: String(b.ea || '').slice(0, 80), plan: b.plan, days: PLANS[b.plan], mentorEmail: String(b.mentorEmail || '').toLowerCase(), device: null, active: true }; out.push(k); }
+  const rb = b.robotId ? db.robots[b.robotId] : null; if (b.robotId && !rb) return res.status(400).json({ ok: false, error: 'Unknown robot' });
+  const out = []; for (let i = 0; i < Math.min(+b.count || 1, 100); i++) { const k = newKey(); db.keys[k] = { created: Date.now(), client: String(b.client || '').slice(0, 80), robotId: b.robotId || null, ea: rb ? rb.name : String(b.ea || '').slice(0, 80), plan: b.plan, days: PLANS[b.plan], mentorEmail: String(b.mentorEmail || '').toLowerCase(), device: null, active: true }; out.push(k); }
   save(); res.json({ ok: true, keys: out });
 });
 app.get('/admin/keys', admin, (req, res) => res.json({ ok: true, keys: db.keys }));
@@ -59,7 +70,9 @@ app.post('/license/activate', wrap((req, res) => {
   if (expired(k)) return res.status(403).json({ ok: false, error: 'This licence has expired.' });
   if (k.device && k.device !== dev) return res.status(403).json({ ok: false, error: 'Key already used on another device.' });
   k.device = dev; k.activated = k.activated || Date.now(); db.lic[key] = db.lic[key] || { logs: [], running: false, cfg: {}, acct: null, seen: {} };
-  save(); res.json({ ok: true });
+  const rb = k.robotId && db.robots[k.robotId];
+  if (rb && !rb.active) return res.status(403).json({ ok: false, error: 'This robot is currently unavailable.' });
+  save(); res.json({ ok: true, robot: rb ? { name: rb.name, author: rb.author, platform: rb.platform, cover: rb.cover } : null });
 }));
 const auth = (req, res, next) => { const k = (req.get('X-License') || '').toUpperCase(); const kk = db.keys[k]; if (!kk || !kk.active || expired(kk) || mentorOff(kk) || !db.lic[k]) return res.status(401).json({ ok: false, error: 'Not licensed' }); req.key = k; req.L = db.lic[k]; next(); };
 const llog = (L, m) => { L.logs.push({ t: Date.now(), m: `[${new Date().toTimeString().slice(0, 8)}] ${m}` }); if (L.logs.length > 500) L.logs.splice(0, L.logs.length - 500); save(); };
