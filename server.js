@@ -168,16 +168,42 @@ app.post('/positions/close', auth, wrap(async (req, res) => {
   llog(req.L, `Closed position ${req.body.id}`); res.json({ ok: true });
 }));
 
-/* ---------- chart scanner (vision) ---------- */
+/* ---------- live scanner: strategy rules on real candles ---------- */
+app.post('/scan/live', auth, async (req, res) => {
+  try {
+    const sym = String(req.body.symbol || '').toUpperCase(); if (!map(sym)) return res.status(400).json({ ok: false, error: 'Unsupported symbol' });
+    const htf = await candles(sym, '4h', 120), ltf = await candles(sym, '15min', 200);
+    const r = analyze(htf, ltf, { buffer: htf[htf.length - 1].c * 0.0002 });
+    if (r.signal === 'WAIT') return res.json({ ok: true, bias: 'WAIT', entry: '—', sl: '—', tp: '—', note: r.reason });
+    const d = digits(r.entry), f = x => (+x).toFixed(d);
+    res.json({ ok: true, bias: r.signal, entry: f(r.entry), sl: f(r.sl), tp: f(r.tp), note: `RR ${r.rr} · confidence ${r.confidence}% · ${r.reason}` });
+  } catch (e) { res.status(502).json({ ok: false, error: e.message }); }
+});
+
+/* ---------- chart scanner (vision): Gemini preferred, Anthropic optional ---------- */
+const SCAN_PROMPT = 'You read trading chart screenshots using the liquidity-sweep method (higher-timeframe liquidity sweep, lower-timeframe CHoCH, entry at order block/FVG, stop beyond the order block, take profit at the next swing). Respond with ONLY JSON: {"bias":"BUY|SELL|WAIT","entry":"price or zone","sl":"price","tp":"price","note":"one sentence; say clearly if prices are unreadable"}. Never invent prices that are not visible on the chart.';
+const parseJson = t => { const a = t.indexOf('{'), b = t.lastIndexOf('}'); if (a < 0 || b < a) throw new Error('No JSON in reply'); return JSON.parse(t.slice(a, b + 1)); };
 app.post('/scan', auth, wrap(async (req, res) => {
-  if (!E.ANTHROPIC_API_KEY) return res.status(501).json({ ok: false, error: 'Scanner not configured (set ANTHROPIC_API_KEY)' });
+  if (!E.GEMINI_API_KEY && !E.ANTHROPIC_API_KEY) return res.status(501).json({ ok: false, error: 'Scanner not configured (set GEMINI_API_KEY)' });
   const m = /^data:(image\/\w+);base64,(.+)$/.exec(req.body.image || ''); if (!m) return res.status(400).json({ ok: false, error: 'Bad image' });
-  const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': E.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, body: JSON.stringify({ model: E.SCAN_MODEL || 'claude-sonnet-5-5', max_tokens: 400, messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } }, { type: 'text', text: 'You read trading chart screenshots using the liquidity-sweep method (HTF sweep, LTF CHoCH, entry at order block/FVG, SL beyond OB, TP at next swing). Respond with ONLY JSON: {"bias":"BUY|SELL|WAIT","entry":"price or zone","sl":"price","tp":"price","note":"one sentence; say if prices are unreadable"}. Never invent prices not visible on the chart.' }] }] }) });
-  const j = await r.json(); if (!r.ok) return res.status(502).json({ ok: false, error: j.error?.message || 'Scan failed' });
-  const t = (j.content || []).map(c => c.text || '').join(''); const o = JSON.parse(t.slice(t.indexOf('{'), t.lastIndexOf('}') + 1));
-  res.json({ ok: true, bias: o.bias, entry: o.entry, sl: o.sl, tp: o.tp, note: o.note });
+  let text;
+  if (E.GEMINI_API_KEY) {
+    const base = E.GEMINI_BASE || 'https://generativelanguage.googleapis.com', model = E.GEMINI_MODEL || 'gemini-2.5-flash';
+    const r = await fetch(`${base}/v1beta/models/${model}:generateContent`, { method: 'POST', headers: { 'x-goog-api-key': E.GEMINI_API_KEY, 'content-type': 'application/json' },
+      body: JSON.stringify({ contents: [{ parts: [{ text: SCAN_PROMPT }, { inline_data: { mime_type: m[1], data: m[2] } }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0.2, maxOutputTokens: 600 } }) });
+    const j = await r.json().catch(() => ({})); if (!r.ok) return res.status(502).json({ ok: false, error: j.error?.message || 'Scan failed' });
+    text = (j.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');
+    if (!text) return res.status(502).json({ ok: false, error: 'Scanner returned no result (image may have been blocked)' });
+  } else {
+    const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': E.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, body: JSON.stringify({ model: E.SCAN_MODEL || 'claude-sonnet-5-5', max_tokens: 400, messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } }, { type: 'text', text: SCAN_PROMPT }] }] }) });
+    const j = await r.json(); if (!r.ok) return res.status(502).json({ ok: false, error: j.error?.message || 'Scan failed' });
+    text = (j.content || []).map(c => c.text || '').join('');
+  }
+  let o; try { o = parseJson(text); } catch { return res.status(502).json({ ok: false, error: 'Could not understand the scan result, try again' }); }
+  const bias = ['BUY', 'SELL', 'WAIT'].includes(String(o.bias).toUpperCase()) ? String(o.bias).toUpperCase() : 'WAIT';
+  res.json({ ok: true, bias, entry: String(o.entry ?? '—'), sl: String(o.sl ?? '—'), tp: String(o.tp ?? '—'), note: String(o.note ?? '') });
 }));
 
 app.get('/health', (q, r) => r.json({ ok: true, dryRun: DRY }));
 if (require.main === module) app.listen(PORT, () => console.log(`Godfather-EA server :${PORT} dryRun=${DRY}`));
-module.exports = { app };
+module.exports = { app, cache };
