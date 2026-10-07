@@ -2,7 +2,7 @@ const express = require('./mini'), fs = require('fs'), crypto = require('crypto'
 const { analyze } = require('./strategy');
 const E = process.env, PORT = +E.PORT || 8080, DRY = (E.DRY_RUN || 'true') !== 'false';
 const DATA = E.DATA_FILE || './data.json', SCAN_MS = (+E.SCAN_SECONDS || 60) * 1000;
-const PROV = 'https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai';
+const PROV = E.METAAPI_PROV_BASE || 'https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai';
 const CLIENT = E.METAAPI_CLIENT_HOST || 'https://mt-client-api-v1.new-york.agiliumtrade.ai';
 const ALPH = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
@@ -79,23 +79,45 @@ const llog = (L, m) => { L.logs.push({ t: Date.now(), m: `[${new Date().toTimeSt
 
 /* ---------- MetaAPI ---------- */
 const mh = () => ({ 'auth-token': E.METAAPI_TOKEN, 'Content-Type': 'application/json' });
-async function mreq(url, method = 'GET', body) {
-  if (!E.METAAPI_TOKEN) throw new Error('METAAPI_TOKEN not set');
-  const r = await fetch(url, { method, headers: mh(), body: body ? JSON.stringify(body) : undefined });
+async function mreq(url, method = 'GET', body, extra = {}) {
+  if (!E.METAAPI_TOKEN) throw Object.assign(new Error('Server is missing METAAPI_TOKEN'), { friendly: true });
+  const r = await fetch(url, { method, headers: { ...mh(), ...extra }, body: body ? JSON.stringify(body) : undefined });
   const txt = await r.text(); let j; try { j = JSON.parse(txt); } catch { j = { raw: txt }; }
-  if (!r.ok) throw new Error(j.message || j.error || `MetaAPI ${r.status}`);
-  return j;
+  if (!r.ok && r.status !== 202) { const e = new Error(j.message || j.error || `MetaAPI error ${r.status}`); e.status = r.status; e.code = j.details?.code || j.code; e.details = j.details; throw e; }
+  return Object.assign(Array.isArray(j) ? { list: j } : j, { _status: r.status, _retry: +r.headers.get('retry-after') || 0 });
+}
+const friendly = e => {
+  const d = e.details, c = String(e.code || ''), m = e.message || '';
+  if (e.status === 401 || e.status === 403) return 'The server\'s MetaAPI token is wrong or expired. Tell your admin.';
+  if (/SRV_NOT_FOUND|server.*not found/i.test(c + m)) { const n = (d?.serverNames || []).slice(0, 5); return 'Broker server name not found. Type it exactly as shown in MetaTrader (e.g. ICMarketsSC-Demo)' + (n.length ? '. Did you mean: ' + n.join(', ') + '?' : '.'); }
+  if (/AUTH/i.test(c) || /incorrect|invalid.*(password|login)|authenticat/i.test(m)) return 'Login or password is incorrect for this broker server. Check the account number, use the MASTER (trading) password, and make sure the server name matches your account (demo vs live) and that MT4 / MT5 matches your account type.';
+  if (/SERVER_TIMEZONE|timezone/i.test(c + m)) return 'The broker is not supported yet. Ask your admin to add this broker server.';
+  return m;
+};
+async function createAccount(body) {
+  const tx = crypto.randomBytes(16).toString('hex'); let r;
+  for (let i = 0; i < 8; i++) {                 // MetaAPI answers 202 while it detects broker settings; repeat with the same transaction-id
+    r = await mreq(`${PROV}/users/current/accounts`, 'POST', body, { 'transaction-id': tx });
+    if (r._status !== 202) return r;
+    await new Promise(ok => setTimeout(ok, Math.min(Math.max(r._retry, 1), 10) * 1000));
+  }
+  throw Object.assign(new Error('The broker is taking too long to respond. Try again in a minute.'), { friendly: true });
 }
 app.post('/accounts/link', auth, wrap(async (req, res) => {
   const { platform, server, login, password, symbols, lot } = req.body;
-  if (!server || !login || !password) return res.status(400).json({ ok: false, error: 'Missing fields' });
+  if (!server || !login || !password) return res.status(400).json({ ok: false, error: 'Fill in broker server, account number and password.' });
+  const plat = String(platform).toLowerCase() === 'mt4' ? 'mt4' : 'mt5', lg = String(login).trim(), srv = String(server).trim();
   try {
-    const a = await mreq(`${PROV}/users/current/accounts`, 'POST', { name: `GF-${req.key.slice(3, 7)}-${login}`, type: 'cloud-g2', login: String(login), password, server, platform: String(platform).toLowerCase() === 'mt4' ? 'mt4' : 'mt5', magic: 777, application: 'MetaApi' });
-    try { await mreq(`${PROV}/users/current/accounts/${a.id}/deploy`, 'POST'); } catch {}
-    req.L.acct = { id: a.id, platform, server, login: String(login), suffix: req.L.acct?.suffix || '' };
-  } catch (e) { return res.status(400).json({ ok: false, error: e.message }); }
+    let acct = null;
+    try { const ex = await mreq(`${PROV}/users/current/accounts?query=${encodeURIComponent(lg)}`); acct = (ex.list || []).find(a => String(a.login) === lg && String(a.server).toLowerCase() === srv.toLowerCase() && a.platform === plat); } catch {}
+    if (acct) await mreq(`${PROV}/users/current/accounts/${acct.id || acct._id}`, 'PUT', { password, name: acct.name, server: srv }).catch(() => {});
+    else acct = await createAccount({ name: `GF-${req.key.slice(3, 7)}-${lg}`, type: 'cloud-g2', login: lg, password, server: srv, platform: plat, magic: 777, application: 'MetaApi' });
+    const id = acct.id || acct._id; if (!id) throw new Error('Could not create the account. Try again.');
+    try { await mreq(`${PROV}/users/current/accounts/${id}/deploy`, 'POST'); } catch {}
+    req.L.acct = { id, platform, server: srv, login: lg, suffix: req.L.acct?.suffix || '' };
+  } catch (e) { console.error('link', e.status, e.code, e.message); return res.status(e.status === 401 || e.status === 403 ? 502 : 400).json({ ok: false, error: e.friendly ? e.message : friendly(e) }); }
   req.L.cfg = Object.assign(req.L.cfg, { symbols: symbols || [], lot: +lot || .05 });
-  llog(req.L, `Account ${login} linked (${platform})`); save(); res.json({ ok: true });
+  llog(req.L, `Account ${lg} linked (${platform})`); save(); res.json({ ok: true });
 }));
 
 /* ---------- market data (Twelve Data) ---------- */
@@ -179,30 +201,6 @@ app.post('/scan/live', auth, async (req, res) => {
     res.json({ ok: true, bias: r.signal, entry: f(r.entry), sl: f(r.sl), tp: f(r.tp), note: `RR ${r.rr} · confidence ${r.confidence}% · ${r.reason}` });
   } catch (e) { res.status(502).json({ ok: false, error: e.message }); }
 });
-
-/* ---------- chart scanner (vision): Gemini preferred, Anthropic optional ---------- */
-const SCAN_PROMPT = 'You read trading chart screenshots using the liquidity-sweep method (higher-timeframe liquidity sweep, lower-timeframe CHoCH, entry at order block/FVG, stop beyond the order block, take profit at the next swing). Respond with ONLY JSON: {"bias":"BUY|SELL|WAIT","entry":"price or zone","sl":"price","tp":"price","note":"one sentence; say clearly if prices are unreadable"}. Never invent prices that are not visible on the chart.';
-const parseJson = t => { const a = t.indexOf('{'), b = t.lastIndexOf('}'); if (a < 0 || b < a) throw new Error('No JSON in reply'); return JSON.parse(t.slice(a, b + 1)); };
-app.post('/scan', auth, wrap(async (req, res) => {
-  if (!E.GEMINI_API_KEY && !E.ANTHROPIC_API_KEY) return res.status(501).json({ ok: false, error: 'Scanner not configured (set GEMINI_API_KEY)' });
-  const m = /^data:(image\/\w+);base64,(.+)$/.exec(req.body.image || ''); if (!m) return res.status(400).json({ ok: false, error: 'Bad image' });
-  let text;
-  if (E.GEMINI_API_KEY) {
-    const base = E.GEMINI_BASE || 'https://generativelanguage.googleapis.com', model = E.GEMINI_MODEL || 'gemini-2.5-flash';
-    const r = await fetch(`${base}/v1beta/models/${model}:generateContent`, { method: 'POST', headers: { 'x-goog-api-key': E.GEMINI_API_KEY, 'content-type': 'application/json' },
-      body: JSON.stringify({ contents: [{ parts: [{ text: SCAN_PROMPT }, { inline_data: { mime_type: m[1], data: m[2] } }] }], generationConfig: { responseMimeType: 'application/json', temperature: 0.2, maxOutputTokens: 600 } }) });
-    const j = await r.json().catch(() => ({})); if (!r.ok) return res.status(502).json({ ok: false, error: j.error?.message || 'Scan failed' });
-    text = (j.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');
-    if (!text) return res.status(502).json({ ok: false, error: 'Scanner returned no result (image may have been blocked)' });
-  } else {
-    const r = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'x-api-key': E.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' }, body: JSON.stringify({ model: E.SCAN_MODEL || 'claude-sonnet-5-5', max_tokens: 400, messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } }, { type: 'text', text: SCAN_PROMPT }] }] }) });
-    const j = await r.json(); if (!r.ok) return res.status(502).json({ ok: false, error: j.error?.message || 'Scan failed' });
-    text = (j.content || []).map(c => c.text || '').join('');
-  }
-  let o; try { o = parseJson(text); } catch { return res.status(502).json({ ok: false, error: 'Could not understand the scan result, try again' }); }
-  const bias = ['BUY', 'SELL', 'WAIT'].includes(String(o.bias).toUpperCase()) ? String(o.bias).toUpperCase() : 'WAIT';
-  res.json({ ok: true, bias, entry: String(o.entry ?? '—'), sl: String(o.sl ?? '—'), tp: String(o.tp ?? '—'), note: String(o.note ?? '') });
-}));
 
 app.get('/health', (q, r) => r.json({ ok: true, dryRun: DRY }));
 if (require.main === module) app.listen(PORT, () => console.log(`Godfather-EA server :${PORT} dryRun=${DRY}`));
