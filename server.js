@@ -74,7 +74,11 @@ app.post('/license/activate', wrap((req, res) => {
   if (rb && !rb.active) return res.status(403).json({ ok: false, error: 'This robot is currently unavailable.' });
   save(); res.json({ ok: true, robot: rb ? { name: rb.name, author: rb.author, platform: rb.platform, cover: rb.cover } : null });
 }));
-const auth = (req, res, next) => { const k = (req.get('X-License') || '').toUpperCase(); const kk = db.keys[k]; if (!kk || !kk.active || expired(kk) || mentorOff(kk) || !db.lic[k]) return res.status(401).json({ ok: false, error: 'Not licensed' }); req.key = k; req.L = db.lic[k]; next(); };
+const auth = (req, res, next) => { const k = (req.get('X-License') || '').toUpperCase(); const kk = db.keys[k]; if (!kk) return res.status(401).json({ ok: false, error: 'Your licence is not recognised by the server (it may have been reset). Go to Settings → Deactivate & Reset, then activate again with a valid key from your mentor.' });
+  if (!kk.active) return res.status(401).json({ ok: false, error: 'This licence has been revoked.' });
+  if (expired(kk)) return res.status(401).json({ ok: false, error: 'This licence has expired.' });
+  if (mentorOff(kk)) return res.status(401).json({ ok: false, error: 'Your mentor account is deactivated.' });
+  if (!db.lic[k]) return res.status(401).json({ ok: false, error: 'Licence not activated on the server. Go to Settings → Deactivate & Reset, then activate again.' }); req.key = k; req.L = db.lic[k]; next(); };
 const llog = (L, m) => { L.logs.push({ t: Date.now(), m: `[${new Date().toTimeString().slice(0, 8)}] ${m}` }); if (L.logs.length > 500) L.logs.splice(0, L.logs.length - 500); save(); };
 
 /* ---------- MetaAPI ---------- */
